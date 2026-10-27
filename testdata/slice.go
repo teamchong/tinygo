@@ -126,6 +126,10 @@ func main() {
 	grow = append(grow, grow...)
 	printslice("grow", grow)
 
+	zeroElem := make([]struct{}, 0)
+	zeroElem = append(zeroElem, struct{}{})
+	assert(len(zeroElem) == 1)
+
 	// append string to []bytes
 	bytes := append([]byte{1, 2, 3}, "foo"...)
 	print("bytes: len=", len(bytes), " cap=", cap(bytes), " data:")
