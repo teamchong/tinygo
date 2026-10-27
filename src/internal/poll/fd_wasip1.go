@@ -519,6 +519,10 @@ const (
 // package syscall (intentionally duplicated rather than linknamed
 // across the package boundary — see project memory on shim avoidance).
 func wait(fd int, mode uint8) {
+	if task.OnSystemStack() {
+		task.Pause()
+		return
+	}
 	pd := runtime_netpoll_addwait(uint32(fd), mode)
 	task.Pause()
 	runtime_netpoll_done(pd)
@@ -537,6 +541,10 @@ func (fd *FD) parkUntil(mode uint8, deadline time.Time) error {
 	d := time.Until(deadline)
 	if d <= 0 {
 		return ErrDeadlineExceeded
+	}
+	if task.OnSystemStack() {
+		task.Pause()
+		return nil
 	}
 	pd := runtime_netpoll_addwait(uint32(fd.Sysfd), mode)
 	timer := time.AfterFunc(d, func() {
