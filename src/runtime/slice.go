@@ -37,7 +37,11 @@ func sliceGrow(oldBuf unsafe.Pointer, oldLen, oldCap, newCap, elemSize uintptr, 
 	// which seems to be allowed by the Go language specification (but this can be observed by
 	// programs); however, due to memory fragmentation and the current state of the TinyGo
 	// memory allocators, this causes some difficult to debug issues.
-	newCap = 1 << bits.Len(uint(newCap))
+	if oldCap >= 256 && newCap <= oldCap+oldCap/2 {
+		newCap = oldCap + oldCap/2
+	} else {
+		newCap = 1 << bits.Len(uint(newCap))
+	}
 
 	buf := alloc(newCap*elemSize, layout)
 	if oldLen > 0 {

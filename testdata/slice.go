@@ -126,6 +126,9 @@ func main() {
 	grow = append(grow, grow...)
 	printslice("grow", grow)
 
+	large := make([]int, 1024)
+	large = append(large, 1)
+	assert(cap(large) == 1536)
 	zeroElem := make([]struct{}, 0)
 	zeroElem = append(zeroElem, struct{}{})
 	assert(len(zeroElem) == 1)
