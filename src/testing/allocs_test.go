@@ -11,6 +11,8 @@ var (
 
 	memStatsAllocations [101]*byte
 	memStatsAllocation  int
+
+	zeroElemSink []struct{}
 )
 
 func TestMemStatsMallocs(t *testing.T) {
@@ -43,5 +45,19 @@ func TestAllocsPerRun(t *testing.T) {
 		if allocations[i] == allocations[i-1] {
 			t.Fatalf("allocations %d and %d have the same address", i-1, i)
 		}
+	}
+}
+
+func TestSliceGrowZeroElemAllocs(t *testing.T) {
+	elems := make([]struct{}, 10)
+	allocs := testing.AllocsPerRun(100, func() {
+		var s []struct{}
+		zeroElemSink = append(s, elems...)
+	})
+	if allocs != 0 {
+		t.Errorf("got %v allocations for zero-element slice grow, want 0", allocs)
+	}
+	if len(zeroElemSink) != 10 || cap(zeroElemSink) != 10 {
+		t.Fatalf("got len=%d cap=%d, want len=10 cap=10", len(zeroElemSink), cap(zeroElemSink))
 	}
 }
