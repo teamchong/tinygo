@@ -176,7 +176,7 @@ func hashmapMake(keySize, valueSize uintptr, sizeHint uintptr, typeInfo unsafe.P
 // it. This is used for the clear builtin, and can be used to reuse a map (to
 // avoid extra heap allocations).
 func hashmapClear(m *hashmap) {
-	if m == nil {
+	if m == nil || m.count == 0 {
 		// Nothing to do. According to the spec:
 		// > If the map or slice is nil, clear is a no-op.
 		return
