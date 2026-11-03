@@ -1,7 +1,15 @@
 package main
 
-import "time"
+import (
+	"io"
+	"os"
+	"time"
+)
 
+//go:noinline
+func writeTo(w io.Writer, b []byte) {
+	_, _ = w.Write(b)
+}
 func init() {
 	println("called init")
 }
@@ -20,6 +28,8 @@ func main() {
 
 //go:wasmexport hello
 func hello() {
+	writeTo(io.Discard, []byte("discard"))
+	writeTo(os.Stdout, nil)
 	println("hello!")
 }
 
