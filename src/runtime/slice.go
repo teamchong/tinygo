@@ -29,6 +29,9 @@ func sliceGrow(oldBuf unsafe.Pointer, oldLen, oldCap, newCap, elemSize uintptr, 
 		// No need to grow, return the input slice.
 		return oldBuf, oldLen, oldCap
 	}
+	if elemSize == 0 {
+		return oldBuf, oldLen, newCap
+	}
 
 	// This can be made more memory-efficient by multiplying by some other constant, such as 1.5,
 	// which seems to be allowed by the Go language specification (but this can be observed by
