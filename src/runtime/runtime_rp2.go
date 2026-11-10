@@ -313,7 +313,7 @@ func coreStackTop(core uint32) uintptr {
 // These spinlocks are needed by the runtime.
 var (
 	printLock     = spinLock{id: 20}
-	schedulerLock = spinLock{id: 21}
+	schedulerLock = schedulerSpinLock{spinLock: spinLock{id: 21}}
 	atomicsLock   = spinLock{id: 22}
 	futexLock     = spinLock{id: 23}
 

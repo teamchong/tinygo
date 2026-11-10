@@ -443,6 +443,47 @@ func main() {
 		}
 		println("reflect map interface key ok")
 	}
+
+	// An array element type that only reflect boxes must stay in the
+	// interface method dispatch. See issue #6168.
+	{
+		var a any = [1]elemStringer{7}
+		println(reflect.ValueOf(a).Index(0).Interface().(stringer).String())
+	}
+
+	println("\nfunc type reflection")
+	for _, fn := range []interface{}{
+		func() {},
+		func(int) {},
+		func(int) int { return 0 },
+		func(int, string) (bool, error) { return false, nil },
+		func(...int) {},
+		func(string, ...int) error { return nil },
+	} {
+		t := reflect.TypeOf(fn)
+		print(t.String(), " NumIn=", t.NumIn(), " NumOut=", t.NumOut(), " Variadic=", t.IsVariadic())
+		for i := 0; i < t.NumIn(); i++ {
+			print(" In(", i, ")=", t.In(i).String())
+		}
+		for i := 0; i < t.NumOut(); i++ {
+			print(" Out(", i, ")=", t.Out(i).String())
+		}
+		println()
+	}
+	{
+		type namedFunc func(int) string
+		var f namedFunc
+		t := reflect.TypeOf(f)
+		println(t.String(), "NumIn=", t.NumIn(), "In(0)=", t.In(0).String(), "NumOut=", t.NumOut(), "Out(0)=", t.Out(0).String())
+	}
+}
+
+type elemStringer int
+
+func (e elemStringer) String() string { return "elemStringer " + strconv.Itoa(int(e)) }
+
+type stringer interface {
+	String() string
 }
 
 func emptyFunc() {

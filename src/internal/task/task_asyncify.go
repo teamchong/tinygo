@@ -23,6 +23,7 @@ type state struct {
 	stackState
 
 	stackBase uintptr
+	stackSize uintptr
 	launched  bool
 
 	// finishing marks a goroutine that paused after it completed.
@@ -33,8 +34,8 @@ type state struct {
 	panicReplay    uintptr
 	panicTarget    uintptr
 
-	// nextStack and prevStack link the tasks whose stacks the GC scans.
-	nextStack, prevStack *Task
+	// stackEnd is the address after the last byte of the stack buffer.
+	stackEnd uintptr
 
 	// running is set while Resume runs this task, so a task that resumed
 	// another from a JS callback is known to have frames below csp.
@@ -70,7 +71,7 @@ func start(fn uintptr, args unsafe.Pointer, stackSize uintptr) {
 	inheritSynctest(t)
 	addLiveTask(t)
 	t.state.initialize(fn, args, stackSize)
-	linkStack(t)
+	setStackOwner(t)
 	scheduleTask(t)
 }
 
@@ -86,9 +87,11 @@ func (s *state) initialize(fn uintptr, args unsafe.Pointer, stackSize uintptr) {
 	s.entry = fn
 	s.args = args
 
-	// Create a stack.
-	stack := runtime_alloc(stackSize, stackLayout())
+	// Create a stack. The last word holds the owner, see setStackOwner.
+	stackSize = stackBodySize(stackSize)
+	stack := allocStack(stackSize)
 	s.stackBase = uintptr(stack)
+	s.stackSize = stackSize
 
 	// Set up the stack canary, a random number that should be checked when
 	// switching from the task back to the scheduler. The stack canary pointer
@@ -99,8 +102,9 @@ func (s *state) initialize(fn uintptr, args unsafe.Pointer, stackSize uintptr) {
 
 	// Calculate stack base addresses.
 	s.asyncifysp = unsafe.Add(stack, unsafe.Sizeof(uintptr(0)))
-	s.csp = unsafe.Add(stack, stackSize)
-	s.top = unsafe.Add(stack, stackSize)
+	s.stackEnd = uintptr(stack) + stackSize
+	s.top = unsafe.Pointer((s.stackEnd - ownerSize) &^ 15)
+	s.csp = s.top
 }
 
 //go:linkname memzero runtime.memzero
@@ -226,7 +230,7 @@ func (t *Task) Resume() {
 		runtimeFatal("stack overflow")
 	}
 	if t.Exited {
-		runtime_freeTaskStack(t.state.stackBase)
+		releaseStack(t.state.stackBase, t.state.stackSize)
 		t.state = state{}
 		t.gcData = gcData{}
 		t.DeferFrame = nil

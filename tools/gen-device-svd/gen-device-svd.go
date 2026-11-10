@@ -359,7 +359,7 @@ func readSVD(path, sourceURL string) (*Device, error) {
 		return nil, err
 	}
 	defer f.Close()
-	decoder := xml.NewDecoder(f)
+	decoder := xml.NewDecoder(bufio.NewReaderSize(f, 1<<20))
 	device := &SVDFile{}
 	err = decoder.Decode(device)
 	if err != nil {
@@ -688,12 +688,9 @@ func parseBitfields(groupName, regName string, fieldEls []*SVDField, bitfieldPre
 		}
 
 		da := decodeDimArray(fieldEl.Dim, fieldEl.DimIndex, fieldEl.DimIncrement, "field", fieldNameTpl)
-		da.rangeElems(func(ia int, _ uint32) bool {
-			if da != nil {
-				lsb += da.incr
-				msb += da.incr
-			}
+		da.rangeElems(func(ia int, offset uint32) bool {
 			fieldName := da.replace(fieldNameTpl, ia)
+			lsb, msb := lsb+offset, msb+offset
 
 			// The enumerated values can be the same as another field, so to avoid
 			// duplication SVD files can simply refer to another set of enumerated
@@ -805,6 +802,7 @@ func parseBitfields(groupName, regName string, fieldEls []*SVDField, bitfieldPre
 				}
 				enumDefault.resolve()
 			}
+
 			return true
 		})
 	}
@@ -1227,7 +1225,7 @@ func writeGo(outdir string, device *Device, interruptSystem string) error {
 		return err
 	}
 	defer outf.Close()
-	w := bufio.NewWriter(outf)
+	w := bufio.NewWriterSize(outf, 1<<20)
 
 	maxInterruptValue := 0
 	for _, intr := range device.Interrupts {

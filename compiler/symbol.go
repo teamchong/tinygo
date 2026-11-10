@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"iter"
 	"slices"
 	"strconv"
 	"strings"
@@ -25,21 +26,46 @@ import (
 // The linkName value contains a valid link name, even if //go:linkname is not
 // present.
 type functionInfo struct {
-	wasmModule    string     // go:wasm-module
-	wasmName      string     // wasm-export-name or wasm-import-name in the IR
-	wasmExport    string     // go:wasmexport is defined (export is unset, this adds an exported wrapper)
-	wasmExportPos token.Pos  // position of //go:wasmexport comment
-	linkName      string     // go:linkname, go:export - the IR function name
-	section       string     // go:section - object file section name
-	exported      bool       // go:export, CGo
-	interrupt     bool       // go:interrupt
-	nobounds      bool       // go:nobounds
-	noescape      bool       // go:noescape
-	noheap        bool       // go:noheap
-	noruntime     bool       // go:noruntime
-	variadic      bool       // go:variadic (CGo only)
-	inline        inlineType // go:inline
+	wasmModule    string    // go:wasm-module
+	wasmName      string    // wasm-export-name or wasm-import-name in the IR
+	wasmExport    string    // go:wasmexport is defined (export is unset, this adds an exported wrapper)
+	wasmExportPos token.Pos // position of //go:wasmexport comment
+	linkName      string    // go:linkname, go:export - the IR function name
+	section       string    // go:section - object file section name
+	flags         functionFlags
 }
+
+// functionFlags holds the boolean attributes and the inlineType of a function.
+type functionFlags uint
+
+const (
+	funcExported    functionFlags = 1 << iota // go:export, CGo
+	funcInterrupt                             // go:interrupt
+	funcNoBounds                              // go:nobounds
+	funcNoEscape                              // go:noescape
+	funcNoHeap                                // go:noheap
+	funcNoRuntime                             // go:noruntime
+	funcVariadic                              // go:variadic (CGo only)
+	funcInlineShift = iota                    // go:inline, go:noinline
+)
+
+const funcInlineMask functionFlags = 0b11 << funcInlineShift
+
+func (info *functionInfo) inline() inlineType {
+	return inlineType((info.flags & funcInlineMask) >> funcInlineShift)
+}
+
+func (info *functionInfo) setInline(inline inlineType) {
+	info.flags = info.flags&^funcInlineMask | functionFlags(inline)<<funcInlineShift
+}
+
+func (info *functionInfo) isExported() bool  { return info.flags&funcExported != 0 }
+func (info *functionInfo) isInterrupt() bool { return info.flags&funcInterrupt != 0 }
+func (info *functionInfo) isNoBounds() bool  { return info.flags&funcNoBounds != 0 }
+func (info *functionInfo) isNoEscape() bool  { return info.flags&funcNoEscape != 0 }
+func (info *functionInfo) isNoHeap() bool    { return info.flags&funcNoHeap != 0 }
+func (info *functionInfo) isNoRuntime() bool { return info.flags&funcNoRuntime != 0 }
+func (info *functionInfo) isVariadic() bool  { return info.flags&funcVariadic != 0 }
 
 type inlineType int
 
@@ -72,15 +98,15 @@ const (
 )
 
 // getFunction returns the LLVM function for the given *ssa.Function, creating
-// it if needed. It can later be filled with compilerContext.createFunction().
-func (c *compilerContext) getFunction(fn *ssa.Function) (llvm.Type, llvm.Value) {
+// it if needed. It can later be filled with context.createFunction().
+func (c *context) getFunction(fn *ssa.Function) (llvm.Type, llvm.Value) {
 	info := c.getFunctionInfo(fn)
 	llvmFn := c.mod.NamedFunction(info.linkName)
 	if !llvmFn.IsNil() {
 		return llvmFn.GlobalValueType(), llvmFn
 	}
 
-	abi := c.getFunctionABI(fn.Signature, info.exported)
+	abi := c.getFunctionABI(fn.Signature, info.isExported())
 	retType := abi.resultType
 
 	var paramInfos []paramInfo
@@ -90,7 +116,7 @@ func (c *compilerContext) getFunction(fn *ssa.Function) (llvm.Type, llvm.Value) 
 			name:     "return",
 			elemSize: c.targetData.TypeAllocSize(retType),
 		})
-		retType = c.ctx.VoidType()
+		retType = c.void
 	}
 	for i, param := range getParams(fn.Signature) {
 		if abi.params[i].indirect {
@@ -107,7 +133,7 @@ func (c *compilerContext) getFunction(fn *ssa.Function) (llvm.Type, llvm.Value) 
 
 	// Add an extra parameter as the function context. This context is used in
 	// closures and bound methods, but should be optimized away when not used.
-	if !info.exported {
+	if !info.isExported() {
 		paramInfos = append(paramInfos, paramInfo{llvmType: c.dataPtrType, name: "context", elemSize: 0})
 	}
 
@@ -118,7 +144,7 @@ func (c *compilerContext) getFunction(fn *ssa.Function) (llvm.Type, llvm.Value) 
 		hasIndirectABI = hasIndirectABI || info.flags&paramIsIndirect != 0
 	}
 
-	fnType := llvm.FunctionType(retType, paramTypes, info.variadic)
+	fnType := llvm.FunctionType(retType, paramTypes, info.isVariadic())
 	llvmFn = llvm.AddFunction(c.mod, info.linkName, fnType)
 	if hasIndirectABI {
 		// Argument promotion only rewrites functions whose uses are all direct
@@ -138,7 +164,7 @@ func (c *compilerContext) getFunction(fn *ssa.Function) (llvm.Type, llvm.Value) 
 		// check here. For more information:
 		// https://reviews.llvm.org/D48443
 		// https://github.com/WebAssembly/tool-conventions/issues/16
-		if info.variadic && len(fn.Params) == 0 {
+		if info.isVariadic() && len(fn.Params) == 0 {
 			attr := c.ctx.CreateStringAttribute("no-prototype", "")
 			llvmFn.AddFunctionAttr(attr)
 		}
@@ -151,7 +177,7 @@ func (c *compilerContext) getFunction(fn *ssa.Function) (llvm.Type, llvm.Value) 
 			dereferenceableOrNull := c.ctx.CreateEnumAttribute(dereferenceableOrNullKind, paramInfo.elemSize)
 			llvmFn.AddAttributeAtIndex(i+1, dereferenceableOrNull)
 		}
-		if info.noescape && paramInfo.flags&paramIsGoParam != 0 && paramInfo.llvmType.TypeKind() == llvm.PointerTypeKind {
+		if info.isNoEscape() && paramInfo.flags&paramIsGoParam != 0 && paramInfo.llvmType.TypeKind() == llvm.PointerTypeKind {
 			// Parameters to functions with a //go:noescape parameter should get
 			// the nocapture attribute. However, the context parameter should
 			// not.
@@ -215,6 +241,16 @@ func (c *compilerContext) getFunction(fn *ssa.Function) (llvm.Type, llvm.Value) 
 		// functionattrs pass from inferring this automatically.
 		llvmFn.AddAttributeAtIndex(2, c.ctx.CreateEnumAttribute(llvm.AttributeKindID(llvmutil.NoCaptureAttrName()), 0))
 		llvmFn.AddAttributeAtIndex(3, c.ctx.CreateEnumAttribute(llvm.AttributeKindID(llvmutil.NoCaptureAttrName()), 0))
+	case "runtime.hashmapStringGet":
+		// The map (param 1) and key data (param 2) are only read, and never
+		// captured. Only the value (param 4) is written. The key comparison is
+		// an indirect call to hashmapStringEqual, so LLVM cannot see this.
+		for _, index := range []int{1, 2} {
+			llvmFn.AddAttributeAtIndex(index, c.ctx.CreateEnumAttribute(llvm.AttributeKindID(llvmutil.NoCaptureAttrName()), 0))
+			llvmFn.AddAttributeAtIndex(index, c.ctx.CreateEnumAttribute(llvm.AttributeKindID("readonly"), 0))
+		}
+		llvmFn.AddAttributeAtIndex(4, c.ctx.CreateEnumAttribute(llvm.AttributeKindID(llvmutil.NoCaptureAttrName()), 0))
+		llvmFn.AddFunctionAttr(c.ctx.CreateStringAttribute(llvmutil.WritesArgsOnlyAttrName, ""))
 	case "runtime.hashmapGet":
 		// The key (param 2) is read-only and never captured.
 		// The value (param 3) is written to (receives the result) but never captured.
@@ -223,15 +259,15 @@ func (c *compilerContext) getFunction(fn *ssa.Function) (llvm.Type, llvm.Value) 
 	case "runtime.hashmapDelete":
 		// The key (param 2) is read-only and never captured.
 		llvmFn.AddAttributeAtIndex(2, c.ctx.CreateEnumAttribute(llvm.AttributeKindID(llvmutil.NoCaptureAttrName()), 0))
-	case "runtime.hashmapGenericSet":
-		// Same as hashmapBinarySet: key (param 2) and value (param 3) are
-		// not captured.
+	case "runtime.hashmapBinarySet", "runtime.hashmapGenericSet":
 		llvmFn.AddAttributeAtIndex(2, c.ctx.CreateEnumAttribute(llvm.AttributeKindID(llvmutil.NoCaptureAttrName()), 0))
 		llvmFn.AddAttributeAtIndex(3, c.ctx.CreateEnumAttribute(llvm.AttributeKindID(llvmutil.NoCaptureAttrName()), 0))
-	case "runtime.hashmapGenericGet":
+	case "runtime.hashmapStringSet":
+		llvmFn.AddAttributeAtIndex(4, c.ctx.CreateEnumAttribute(llvm.AttributeKindID(llvmutil.NoCaptureAttrName()), 0))
+	case "runtime.hashmapBinaryGet", "runtime.hashmapGenericGet":
 		llvmFn.AddAttributeAtIndex(2, c.ctx.CreateEnumAttribute(llvm.AttributeKindID(llvmutil.NoCaptureAttrName()), 0))
 		llvmFn.AddAttributeAtIndex(3, c.ctx.CreateEnumAttribute(llvm.AttributeKindID(llvmutil.NoCaptureAttrName()), 0))
-	case "runtime.hashmapGenericDelete":
+	case "runtime.hashmapBinaryDelete", "runtime.hashmapGenericDelete":
 		llvmFn.AddAttributeAtIndex(2, c.ctx.CreateEnumAttribute(llvm.AttributeKindID(llvmutil.NoCaptureAttrName()), 0))
 	case "runtime.trackPointer":
 		// This function is necessary for tracking pointers on the stack in a
@@ -262,7 +298,7 @@ func (c *compilerContext) getFunction(fn *ssa.Function) (llvm.Type, llvm.Value) 
 
 	// External/exported functions may not retain pointer values.
 	// https://golang.org/cmd/cgo/#hdr-Passing_pointers
-	if info.exported {
+	if info.isExported() {
 		if c.archFamily() == "wasm32" && len(fn.Blocks) == 0 {
 			// We need to add the wasm-import-module and the wasm-import-name
 			// attributes.
@@ -289,7 +325,7 @@ func (c *compilerContext) getFunction(fn *ssa.Function) (llvm.Type, llvm.Value) 
 
 // If this is a synthetic function (such as a generic function or a wrapper),
 // create it now.
-func (c *compilerContext) maybeCreateSyntheticFunction(fn *ssa.Function, llvmFn llvm.Value) {
+func (c *context) maybeCreateSyntheticFunction(fn *ssa.Function, llvmFn llvm.Value) {
 	// Synthetic functions are functions that do not appear in the source code,
 	// they are artificially constructed. Usually they are wrapper functions
 	// that are not referenced anywhere except in a SSA call instruction so
@@ -330,11 +366,11 @@ func (c *compilerContext) maybeCreateSyntheticFunction(fn *ssa.Function, llvmFn 
 // getFunctionInfo returns information about a function that is not directly
 // present in *ssa.Function, such as the link name and whether it should be
 // exported.
-func (c *compilerContext) getFunctionInfo(f *ssa.Function) functionInfo {
+func (c *context) getFunctionInfo(f *ssa.Function) *functionInfo {
 	if info, ok := c.functionInfos[f]; ok {
 		return info
 	}
-	info := functionInfo{
+	info := &functionInfo{
 		// Pick the default linkName.
 		linkName: c.canonicalFunctionName(f),
 	}
@@ -343,41 +379,64 @@ func (c *compilerContext) getFunctionInfo(f *ssa.Function) functionInfo {
 	if info.linkName == "runtime.wasmEntryReactor" && c.BuildMode == "c-shared" {
 		info.linkName = "_initialize"
 		info.wasmName = "_initialize"
-		info.exported = true
+		info.flags |= funcExported
 	}
 	if info.linkName == "runtime.wasmEntryCommand" && c.BuildMode == "default" {
 		info.linkName = "_start"
 		info.wasmName = "_start"
-		info.exported = true
+		info.flags |= funcExported
 	}
 	if info.linkName == "runtime.wasmEntryLegacy" && c.BuildMode == "wasi-legacy" {
 		info.linkName = "_start"
 		info.wasmName = "_start"
-		info.exported = true
+		info.flags |= funcExported
 	}
 
 	// Check for //go: pragmas, which may change the link name (among others).
-	c.parsePragmas(&info, f)
+	c.parsePragmas(info, f)
 
 	c.functionInfos[f] = info
 	return info
 }
 
-func (c *compilerContext) canonicalFunctionName(f *ssa.Function) string {
+func (c *context) canonicalFunctionName(f *ssa.Function) string {
 	typeArgs := f.TypeArgs()
-	if len(typeArgs) == 0 {
-		return f.RelString(nil)
+	name := f.RelString(nil)
+	if len(typeArgs) != 0 {
+		parts := make([]string, len(typeArgs))
+		for i, ta := range typeArgs {
+			parts[i], _ = c.getTypeCodeName(ta)
+		}
+		name = f.Origin().RelString(nil) + "[" + strings.Join(parts, ",") + "]"
 	}
-	parts := make([]string, len(typeArgs))
-	for i, ta := range typeArgs {
-		parts[i], _ = c.getTypeCodeName(ta)
+	return name + methodPackageQualifier(f)
+}
+
+// methodPackageQualifier adds the declaring package to an unexported method
+// promoted from another package, since RelString names it like the type's own.
+func methodPackageQualifier(f *ssa.Function) string {
+	recv := f.Signature.Recv()
+	if recv == nil {
+		return ""
 	}
-	return f.Origin().RelString(nil) + "[" + strings.Join(parts, ",") + "]"
+	obj, ok := f.Object().(*types.Func)
+	if !ok || obj == nil || obj.Exported() || obj.Pkg() == nil {
+		return ""
+	}
+	t := recv.Type()
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = ptr.Elem()
+	}
+	named, ok := types.Unalias(t).(*types.Named)
+	if !ok || named.Obj().Pkg() == nil || named.Obj().Pkg().Path() == obj.Pkg().Path() {
+		return ""
+	}
+	return "$" + obj.Pkg().Path()
 }
 
 // parsePragmas is used by getFunctionInfo to parse function pragmas such as
 // //export or //go:noinline.
-func (c *compilerContext) parsePragmas(info *functionInfo, f *ssa.Function) {
+func (c *context) parsePragmas(info *functionInfo, f *ssa.Function) {
 	syntax := f.Syntax()
 	if f.Origin() != nil {
 		syntax = f.Origin().Syntax()
@@ -466,16 +525,16 @@ func (c *compilerContext) parsePragmas(info *functionInfo, f *ssa.Function) {
 			}
 
 			info.linkName = parts[1]
-			if info.linkName == "llvm.returnaddress" && llvmutil.Version() >= 23 {
+			if info.linkName == "llvm.returnaddress" && llvm.VersionMajor >= 23 {
 				// LLVM 23 requires the pointer-type suffix on this
 				// intrinsic's mangled name.
 				info.linkName = "llvm.returnaddress.p0"
 			}
 			info.wasmName = info.linkName
-			info.exported = true
+			info.flags |= funcExported
 		case "//go:interrupt":
 			if c.checkDefinition(hasBody, comment, pragma) && c.checkUnsafe(f.Pkg, comment, pragma) {
-				info.interrupt = true
+				info.flags |= funcInterrupt
 			}
 		case "//go:wasm-module":
 			// Alternative comment for setting the import module.
@@ -496,7 +555,7 @@ func (c *compilerContext) parsePragmas(info *functionInfo, f *ssa.Function) {
 				continue
 			}
 			c.checkWasmImportExport(f, comment.Text)
-			info.exported = true
+			info.flags |= funcExported
 			info.wasmModule = parts[1]
 			info.wasmName = parts[2]
 		case "//go:wasmexport":
@@ -525,10 +584,10 @@ func (c *compilerContext) parsePragmas(info *functionInfo, f *ssa.Function) {
 			info.wasmExportPos = comment.Slash
 		case "//go:inline":
 			if c.checkDefinition(hasBody, comment, pragma) {
-				info.inline = inlineHint
+				info.setInline(inlineHint)
 			}
 		case "//go:noinline":
-			info.inline = inlineNone
+			info.setInline(inlineNone)
 		case "//go:linkname", "//go:linknamestd":
 			if len(parts) != 3 || parts[1] != f.Name() {
 				continue
@@ -550,7 +609,7 @@ func (c *compilerContext) parsePragmas(info *functionInfo, f *ssa.Function) {
 			}
 			if c.checkDefinition(hasBody, comment, pragma) && c.checkUnsafe(f.Pkg, comment, pragma) {
 				info.section = parts[1]
-				info.inline = inlineNone
+				info.setInline(inlineNone)
 			}
 		case "//go:nobounds":
 			// Skip bounds checking in this function. Useful for some
@@ -558,7 +617,7 @@ func (c *compilerContext) parsePragmas(info *functionInfo, f *ssa.Function) {
 			// This is somewhat dangerous and thus only imported in packages
 			// that import unsafe.
 			if c.checkDefinition(hasBody, comment, pragma) && c.checkUnsafe(f.Pkg, comment, pragma) {
-				info.nobounds = true
+				info.flags |= funcNoBounds
 			}
 		case "//go:noescape":
 			// Don't let pointer parameters escape.
@@ -568,15 +627,15 @@ func (c *compilerContext) parsePragmas(info *functionInfo, f *ssa.Function) {
 				c.addPragmaError(comment, "can only use //go:noescape on declarations")
 				continue
 			}
-			info.noescape = true
+			info.flags |= funcNoEscape
 		case "//go:noheap":
 			// Ensure this function does not allocate on the heap.
 			if c.checkDefinition(hasBody, comment, pragma) {
-				info.noheap = true
+				info.flags |= funcNoHeap
 			}
 		case "//go:noruntime":
 			if c.checkDefinition(hasBody, comment, pragma) {
-				info.noruntime = true
+				info.flags |= funcNoRuntime
 			}
 		case "//go:variadic":
 			// The //go:variadic pragma is emitted by the CGo preprocessing
@@ -585,13 +644,13 @@ func (c *compilerContext) parsePragmas(info *functionInfo, f *ssa.Function) {
 			// functions.
 			if strings.HasPrefix(f.Name(), "_Cgo_") {
 				// This prefix was created as a result of CGo preprocessing.
-				info.variadic = true
+				info.flags |= funcVariadic
 			}
 		}
 	}
 
 	if c.Nobounds {
-		info.nobounds = true
+		info.flags |= funcNoBounds
 	}
 }
 
@@ -609,7 +668,7 @@ var flagPragmas = map[string]bool{
 
 // addPragmaError reports an error once per pragma, even when each generic
 // instantiation parses the same pragma.
-func (c *compilerContext) addPragmaError(comment *ast.Comment, msg string) {
+func (c *context) addPragmaError(comment *ast.Comment, msg string) {
 	if c.pragmaErrors[comment] {
 		return
 	}
@@ -619,7 +678,7 @@ func (c *compilerContext) addPragmaError(comment *ast.Comment, msg string) {
 
 // checkDefinition reports an error if the pragma is not on a function
 // definition.
-func (c *compilerContext) checkDefinition(hasBody bool, comment *ast.Comment, pragma string) bool {
+func (c *context) checkDefinition(hasBody bool, comment *ast.Comment, pragma string) bool {
 	if !hasBody {
 		c.addPragmaError(comment, "can only use "+pragma+" on definitions")
 		return false
@@ -628,7 +687,7 @@ func (c *compilerContext) checkDefinition(hasBody bool, comment *ast.Comment, pr
 }
 
 // checkUnsafe reports an error if the package does not import unsafe.
-func (c *compilerContext) checkUnsafe(pkg *ssa.Package, comment *ast.Comment, pragma string) bool {
+func (c *context) checkUnsafe(pkg *ssa.Package, comment *ast.Comment, pragma string) bool {
 	if !slices.Contains(pkg.Pkg.Imports(), types.Unsafe) {
 		c.addPragmaError(comment, "can only use "+pragma+" in packages that import unsafe")
 		return false
@@ -641,7 +700,7 @@ func (c *compilerContext) checkUnsafe(pkg *ssa.Package, comment *ast.Comment, pr
 //
 // The list of allowed types is based on this proposal:
 // https://github.com/golang/go/issues/59149
-func (c *compilerContext) checkWasmImportExport(f *ssa.Function, pragma string) {
+func (c *context) checkWasmImportExport(f *ssa.Function, pragma string) {
 	if c.pkg.Path() == "runtime" || c.pkg.Path() == "syscall/js" || c.pkg.Path() == "syscall" || c.pkg.Path() == "crypto/internal/sysrand" {
 		// The runtime is a special case. Allow all kinds of parameters
 		// (importantly, including pointers).
@@ -671,7 +730,7 @@ func (c *compilerContext) checkWasmImportExport(f *ssa.Function, pragma string) 
 //
 // This previously reflected the additional restrictions documented here:
 // https://github.com/golang/go/issues/59149
-func (c *compilerContext) isValidWasmType(typ types.Type, site wasmSite) bool {
+func (c *context) isValidWasmType(typ types.Type, site wasmSite) bool {
 	switch typ := typ.Underlying().(type) {
 	case *types.Basic:
 		switch typ.Kind() {
@@ -731,23 +790,30 @@ const (
 	siteIndirect // pointer or field
 )
 
-// getParams returns the function parameters, including the receiver at the
-// start. This is an alternative to the Params member of *ssa.Function, which is
-// not yet populated when the package has not yet been built.
-func getParams(sig *types.Signature) []*types.Var {
-	params := []*types.Var{}
-	if sig.Recv() != nil {
-		params = append(params, sig.Recv())
+// getParams iterates over the function parameters, including the receiver at
+// the start. This is an alternative to the Params member of *ssa.Function, which
+// is not yet populated when the package has not yet been built.
+func getParams(sig *types.Signature) iter.Seq2[int, *types.Var] {
+	return func(yield func(int, *types.Var) bool) {
+		i := 0
+		if recv := sig.Recv(); recv != nil {
+			if !yield(i, recv) {
+				return
+			}
+			i++
+		}
+		for v := range sig.Params().Variables() {
+			if !yield(i, v) {
+				return
+			}
+			i++
+		}
 	}
-	for v := range sig.Params().Variables() {
-		params = append(params, v)
-	}
-	return params
 }
 
 // addStandardDeclaredAttributes adds attributes that are set for any function,
 // whether declared or defined.
-func (c *compilerContext) addStandardDeclaredAttributes(llvmFn llvm.Value) {
+func (c *context) addStandardDeclaredAttributes(llvmFn llvm.Value) {
 	if c.SizeLevel >= 1 {
 		// Set the "optsize" attribute to make slightly smaller binaries at the
 		// cost of minimal performance loss (-Os in Clang).
@@ -774,7 +840,7 @@ func (c *compilerContext) addStandardDeclaredAttributes(llvmFn llvm.Value) {
 // every function defined by TinyGo (even thunks/wrappers), possibly depending
 // on the architecture. It does not set attributes only set for declared
 // functions, use addStandardDeclaredAttributes for this.
-func (c *compilerContext) addStandardDefinedAttributes(llvmFn llvm.Value) {
+func (c *context) addStandardDefinedAttributes(llvmFn llvm.Value) {
 	// TinyGo does not currently raise exceptions, so set the 'nounwind' flag.
 	// This behavior matches Clang when compiling C source files.
 	// It reduces binary size on Linux a little bit on non-x86_64 targets by
@@ -787,10 +853,23 @@ func (c *compilerContext) addStandardDefinedAttributes(llvmFn llvm.Value) {
 		// For details, see: https://llvm.org/docs/LangRef.html#function-attributes
 		llvmFn.AddFunctionAttr(c.ctx.CreateEnumAttribute(llvm.AttributeKindID("uwtable"), 1))
 	}
+	if c.hasFramePointers() {
+		llvmFn.AddFunctionAttr(c.ctx.CreateStringAttribute("frame-pointer", "all"))
+	}
+}
+
+// hasFramePointers reports whether functions keep a frame pointer, so that
+// perf and other frame pointer unwinders can walk native Linux stacks.
+func (c *context) hasFramePointers() bool {
+	parts := strings.Split(c.Triple, "-")
+	if len(parts) < 3 || parts[2] != "linux" {
+		return false
+	}
+	return parts[0] == "x86_64" || parts[0] == "aarch64"
 }
 
 // addStandardAttributes adds all attributes added to defined functions.
-func (c *compilerContext) addStandardAttributes(llvmFn llvm.Value) {
+func (c *context) addStandardAttributes(llvmFn llvm.Value) {
 	c.addStandardDeclaredAttributes(llvmFn)
 	c.addStandardDefinedAttributes(llvmFn)
 }
@@ -810,7 +889,7 @@ type globalInfo struct {
 // functions in the package currently being compiled — functions imported from
 // other packages have their file-level pragmas processed when those packages
 // are compiled.
-func (c *compilerContext) fileForFunc(f *ssa.Function) *ast.File {
+func (c *context) fileForFunc(f *ssa.Function) *ast.File {
 	if c.loaderPkg == nil || f.Pkg == nil || f.Pkg.Pkg != c.loaderPkg.Pkg {
 		return nil
 	}
@@ -838,7 +917,7 @@ func (c *compilerContext) fileForFunc(f *ssa.Function) *ast.File {
 // comments on globals (required for //go:extern pragmas) and free-standing
 // file-level //go:cgo_import_dynamic directives, which are not attached to any
 // declaration and apply to the whole package.
-func (c *compilerContext) loadASTComments(pkg *loader.Package) {
+func (c *context) loadASTComments(pkg *loader.Package) {
 	for _, file := range pkg.Files {
 		// Collect //go:cgo_import_dynamic local [remote ["library"]] directives.
 		// The remote symbol defaults to local. The library operand is ignored.
@@ -889,7 +968,7 @@ func (c *compilerContext) loadASTComments(pkg *loader.Package) {
 
 // getGlobal returns a LLVM IR global value for a Go SSA global. It is added to
 // the LLVM IR if it has not been added already.
-func (c *compilerContext) getGlobal(g *ssa.Global) llvm.Value {
+func (c *context) getGlobal(g *ssa.Global) llvm.Value {
 	info := c.getGlobalInfo(g)
 	llvmGlobal := c.mod.NamedGlobal(info.linkName)
 	if llvmGlobal.IsNil() {
@@ -928,7 +1007,7 @@ func (c *compilerContext) getGlobal(g *ssa.Global) llvm.Value {
 }
 
 // getGlobalInfo returns some information about a specific global.
-func (c *compilerContext) getGlobalInfo(g *ssa.Global) globalInfo {
+func (c *context) getGlobalInfo(g *ssa.Global) globalInfo {
 	if info, ok := c.globalInfos[g]; ok {
 		return info
 	}
@@ -947,7 +1026,7 @@ func (c *compilerContext) getGlobalInfo(g *ssa.Global) globalInfo {
 
 // Parse //go: pragma comments from the source. In particular, it parses the
 // //go:extern and //go:linkname pragmas on globals.
-func (info *globalInfo) parsePragmas(doc *ast.CommentGroup, c *compilerContext, g *ssa.Global) {
+func (info *globalInfo) parsePragmas(doc *ast.CommentGroup, c *context, g *ssa.Global) {
 	for _, comment := range doc.List {
 		if !strings.HasPrefix(comment.Text, "//go:") {
 			continue

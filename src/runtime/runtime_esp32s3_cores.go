@@ -21,7 +21,7 @@ const crossCoreCPUInterrupt = 3
 
 var (
 	printLock     spinLock
-	schedulerLock spinLock
+	schedulerLock schedulerSpinLock
 	atomicsLock   spinLock
 	futexLock     spinLock
 	ticksLock     spinLock
@@ -230,14 +230,13 @@ func schedulerUnlockAndWait() {
 
 	// waiti lowers PS.INTLEVEL and waits in one step, so a wake sent after the
 	// unlock is not lost. See the Xtensa ISA Reference Manual, WAITI.
-	state := interrupt.Disable()
-	schedulerLock.Unlock()
+	// Interrupts stay off from the unlock until the lock is taken again.
+	state := schedulerLock.unlockMasked()
 	for schedulerWakePending[core].Swap(0) == 0 {
 		device.Asm("waiti 0")
 		interrupt.Disable()
 	}
-	interrupt.Restore(state)
-	schedulerLock.Lock()
+	schedulerLock.lockMasked(state)
 }
 
 // Wake another core, if one is waiting or sleeping. Must be called with the
