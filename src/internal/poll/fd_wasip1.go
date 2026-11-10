@@ -548,6 +548,15 @@ func (fd *FD) parkUntil(mode uint8, deadline time.Time) error {
 	return nil
 }
 
+// WaitWrite waits until data can be written to fd.
+func (fd *FD) WaitWrite() error {
+	if fd.wDeadline.IsZero() {
+		wait(fd.Sysfd, pollModeWrite)
+		return nil
+	}
+	return fd.parkUntil(pollModeWrite, fd.wDeadline)
+}
+
 // byteCount turns the -1 a failed read or write returns into 0, as Go's
 // internal/poll does in fd_unix.go.
 func byteCount(n int, err error) (int, error) {
